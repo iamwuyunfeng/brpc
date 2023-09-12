@@ -136,6 +136,7 @@ static const bthread_attr_t BTHREAD_ATTR_DEBUG = {
 };
 
 static const size_t BTHREAD_EPOLL_THREAD_NUM = 1;
+static const size_t BTHREAD_IOURING_THREAD_NUM = 1;
 static const bthread_t BTHREAD_ATOMIC_INIT = 0;
 
 // Min/Max number of work pthreads.

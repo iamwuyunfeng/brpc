@@ -24,6 +24,7 @@
 
 #include <pthread.h>
 #include <sys/socket.h>
+#include <unistd.h>
 #include "bthread/types.h"
 #include "bthread/errno.h"
 
@@ -78,6 +79,15 @@ extern int bthread_close(int fd);
 // Replacement of connect(2) in bthreads.
 extern int bthread_connect(int sockfd, const struct sockaddr* serv_addr,
                            socklen_t addrlen);
+
+#if defined(OS_LINUX)
+#if defined(BRPC_WITH_IOURING)
+// Replacement of pread() in bthreads.
+extern int bthread_fd_pread(int fd, void *buf, size_t nbytes, __off_t offset);
+// Replacement of pwrite() in bthreads.
+extern int bthread_fd_pwrite(int fd, const void *buf, size_t n, __off_t offset);
+#endif
+#endif
 
 // Add a startup function that each pthread worker will run at the beginning
 // To run code at the end, use butil::thread_atexit()

@@ -487,6 +487,200 @@ int pthread_fd_wait(int fd, unsigned events,
     return 0;
 }
 
+#if defined(OS_LINUX)
+#if defined(BRPC_WITH_IOURING)
+
+#include <liburing.h>
+
+typedef butil::atomic<int> IOUringButex;
+
+static IOUringButex* const IOURING_CLOSING_GUARD = (IOUringButex*)(intptr_t)-1L;
+
+#ifndef NDEBUG
+butil::static_atomic<int> io_uring_break_nums = BUTIL_STATIC_ATOMIC_INIT(0);
+#endif
+
+// Able to address 67108864 file descriptors, should be enough.
+LazyArray<IOUringButex *, 262144 /*NBLOCK*/, 256 /*BLOCK_SIZE*/> io_uring_butexes;
+
+static const int BTHREAD_DEFAULT_IOURING_SIZE = 1024;
+
+class IOUringThread {
+public:
+    IOUringThread()
+        : _state(INITIAL)
+        , _tid(0) {
+    }
+
+    int start(int ring_size) {
+        if (started()) {
+            return -1;
+        }
+        _start_mutex.lock();
+        // Double check
+        if (started()) {
+            _start_mutex.unlock();
+            return -1;
+        }
+        int rc = io_uring_queue_init(ring_size, &_ring, 0);
+        if (rc != 0) {
+            LOG(FATAL) << "Fail to init io_uring";
+            return -1;
+        }
+        _state = RUNNING;
+        _start_mutex.unlock();
+        if (bthread_start_background(
+                &_tid, NULL, IOUringThread::run_this, this) != 0) {
+            LOG(FATAL) << "Fail to create io_uring bthread";
+            return -1;
+        }
+        return 0;
+    }
+
+    int stop_and_join() {
+        if (!started()) {
+            return 0;
+        }
+        _state = STOPPED;
+        io_uring_queue_exit(&_ring);
+        const int rc = bthread_join(_tid, NULL);
+        if (rc) {
+            LOG(FATAL) << "Fail to join IOUringThread, " << berror(rc);
+            return -1;
+        }
+        return 0;
+    }
+
+    bool started() const { return _state == RUNNING; }
+
+    int fd_pread(int fd, void *buf, size_t nbytes, __off_t offset) {
+        butil::atomic<IOUringButex *> *p = io_uring_butexes.get_or_new(fd);
+        if (NULL == p) {
+            errno = ENOMEM;
+            return -1;
+        }
+
+        IOUringButex* butex = p->load(butil::memory_order_consume);
+        if (NULL == butex) {
+            // It is rare to wait on one file descriptor from multiple threads
+            // simultaneously. Creating singleton by optimistic locking here
+            // saves mutexes for each butex.
+            butex = butex_create_checked<IOUringButex>();
+            butex->store(0, butil::memory_order_relaxed);
+            IOUringButex* expected = NULL;
+            if (!p->compare_exchange_strong(expected, butex,
+                                            butil::memory_order_release,
+                                            butil::memory_order_consume)) {
+                butex_destroy(butex);
+                butex = expected;
+            }
+        }
+
+        while (butex == CLOSING_GUARD) {  // bthread_close() is running.
+            if (sched_yield() < 0) {
+                return -1;
+            }
+            butex = p->load(butil::memory_order_consume);
+        }
+        // Save value of butex before adding to epoll because the butex may
+        // be changed before butex_wait. No memory fence because EPOLL_CTL_MOD
+        // and EPOLL_CTL_ADD shall have release fence.
+        const int expected_val = butex->load(butil::memory_order_relaxed);
+
+        io_uring_sqe *sqe = io_uring_get_sqe(&_ring);
+        io_uring_prep_read(sqe, fd, buf, nbytes, offset);
+        io_uring_sqe_set_data(sqe, &fd);
+        if (io_uring_submit(&_ring) != 0) {
+            PLOG(FATAL) << "Fail to submit read op to fd=" << fd << " into ring=" << static_cast<void*>(&_ring);
+            return -1;
+        }
+
+        if (butex_wait(butex, expected_val, NULL) < 0 &&
+            errno != EWOULDBLOCK && errno != EINTR) {
+            return -1;
+        }
+        return 0;
+    }
+
+    int fd_pwrite(int fd, const void *buf, size_t n, __off_t offset) {
+      // TODO
+      return ENOTSUP;
+    }
+    
+private:
+    static void* run_this(void* arg) {
+        return static_cast<IOUringThread *>(arg)->run();
+    }
+
+    void *run() {
+        while (_state != STOPPED) {
+            io_uring_cqe *cqe;
+            const int rc = io_uring_wait_cqe(&_ring, &cqe);
+
+            if (_state == STOPPED) {
+            break;
+            }
+
+            if (rc != 0) {
+                PLOG(INFO) << "Fail to wait cqe on ring=" << static_cast<void*>(&_ring);
+                break;
+            }
+
+            int* fd = static_cast<int*>(io_uring_cqe_get_data(cqe));
+            butil::atomic<IOUringButex *> *pbutex = fd ? io_uring_butexes.get(*fd) : NULL;
+            IOUringButex *butex =
+                pbutex ? pbutex->load(butil::memory_order_consume) : NULL;
+            if (butex != NULL && butex != CLOSING_GUARD) {
+                butex->fetch_add(1, butil::memory_order_relaxed);
+                butex_wake_all(butex);
+            }
+        }
+        DLOG(INFO) << "IOUringThread=" << _tid << "(ring="
+                   << static_cast<void*>(&_ring) << ") is about to stop";
+        return NULL;
+    }
+
+    enum State {
+      INITIAL,
+      RUNNING,
+      STOPPED
+    };
+
+    struct io_uring _ring;
+    State _state;
+    bthread_t _tid;
+    butil::Mutex _start_mutex;
+};
+
+IOUringThread io_uring_thread[BTHREAD_IOURING_THREAD_NUM];
+
+static inline IOUringThread& get_io_uring_thread(int fd) {
+    if (BTHREAD_IOURING_THREAD_NUM == 1UL) {
+        IOUringThread& ring = io_uring_thread[0];
+        ring.start(BTHREAD_DEFAULT_IOURING_SIZE);
+        return ring;
+    }
+
+    IOUringThread& ring = io_uring_thread[butil::fmix32(fd) % BTHREAD_EPOLL_THREAD_NUM];
+    ring.start(BTHREAD_DEFAULT_IOURING_SIZE);
+    return ring;
+}
+
+//TODO(zhujiashun): change name
+int stop_and_join_io_uring_threads() {
+    // Returns -1 if any epoll thread failed to stop.
+    int rc = 0;
+    for (size_t i = 0; i < BTHREAD_IOURING_THREAD_NUM; ++i) {
+        if (io_uring_thread[i].stop_and_join() < 0) {
+            rc = -1;
+        }
+    }
+    return rc;
+}
+
+#endif
+#endif
+
 }  // namespace bthread
 
 extern "C" {
@@ -558,5 +752,37 @@ int bthread_connect(int sockfd, const sockaddr* serv_addr,
 int bthread_close(int fd) {
     return bthread::get_epoll_thread(fd).fd_close(fd);
 }
+
+#if defined(OS_LINUX)
+#if defined(BRPC_WITH_IOURING)
+
+int bthread_fd_pread(int fd, void *buf, size_t nbytes, __off_t offset) {
+    if (fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    bthread::TaskGroup* g = bthread::tls_task_group;
+    if (NULL != g && !g->is_current_pthread_task()) {
+        return bthread::get_io_uring_thread(fd).fd_pread(
+            fd, buf, nbytes, offset);
+    }
+    return EINVAL;
+}
+
+int bthread_fd_pwrite(int fd, const void *buf, size_t n, __off_t offset) {
+    if (fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    bthread::TaskGroup* g = bthread::tls_task_group;
+    if (NULL != g && !g->is_current_pthread_task()) {
+        return bthread::get_io_uring_thread(fd).fd_pwrite(
+            fd, buf, n, offset);
+    }
+    return EINVAL;
+}
+
+#endif
+#endif
 
 }  // extern "C"
